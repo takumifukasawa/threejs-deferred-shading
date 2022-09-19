@@ -1,0 +1,509 @@
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0"
+          name="viewport">
+    <meta content="ie=edge" http-equiv="X-UA-Compatible">
+    <title>threejs-deferred-shading: base</title>
+    
+    <style type="text/css">
+        html, body {
+            background-color: black;
+        }
+        #js-wrapper {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        
+        #js-canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+
+<div id="js-wrapper">
+    <canvas id="js-canvas"></canvas>
+</div>
+
+<script src="https://unpkg.com/three@0.144.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.144.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+    // -----------------------------------------------------------------------------
+    // ref:
+    // https://threejs.org/examples/webgl2_multiple_rendertargets.html
+    // https://github.com/mrdoob/three.js/blob/master/src/renderers/WebGLMultipleRenderTargets.js
+    // https://threejs.org/examples/webgl_depth_texture.html
+    // https://enginetrouble.net/2016/10/reconstructing-world-position-from-depth-2016.html
+    // https://gamedev.stackexchange.com/questions/56897/glsl-light-attenuation-color-and-intensity-formula
+    // -----------------------------------------------------------------------------
+
+    const lightPropsNum = 16;
+    
+    const gbufferVertexShaderText = `
+in vec3 position;
+in vec3 normal;
+in vec2 uv;
+out vec3 vNormal;
+out vec2 vUv;
+// out vec3 vWorldPosition;
+uniform mat4 modelMatrix;
+uniform mat4 viewMatrix;
+uniform mat4 projectionMatrix;
+uniform mat3 normalMatrix;
+uniform mat3 uWorldNormalMatrix;
+
+void main() {
+    vUv = uv;
+    vec4 worldPosition = modelMatrix * vec4(position, 1.);
+    vec4 viewPosition = viewMatrix * worldPosition;
+    
+    // mat4 worldNormalMatrix = transpose(modelMatrix);
+    // vec3 transformedNormal = normalMatrix * normal;
+    // vec3 transformedNormal = (worldNormalMatrix * vec4(normal, 1.)).xyz;
+    vec3 transformedNormal = uWorldNormalMatrix * normal;
+    
+    vNormal = normalize(transformedNormal);
+    // vWorldPosition = worldPosition.xyz;
+    gl_Position = projectionMatrix * viewPosition;
+}
+`;
+    const gbufferFragmentShaderText = `
+precision highp float;
+precision highp int;
+layout(location = 0) out vec4 gColor;
+layout(location = 1) out vec4 gNormal;
+// layout(location = 2) out vec4 gWorldPosition;
+in vec3 vNormal;
+in vec2 vUv;
+// in vec3 vWorldPosition;
+// uniform vec3 uEmission;
+uniform float uMaterial;
+uniform vec3 uBaseColor;
+
+void main() {
+    // TODO: each mesh color
+    gColor = vec4(uBaseColor, uMaterial);
+    vec3 normal = (normalize(vNormal) + 1.) * .5;
+    gNormal = vec4(normal , 1.);
+    // gWorldPosition = vec4(vWorldPosition, 1.);
+}
+`;
+    const renderVertexShaderText = `
+in vec3 position;
+in vec2 uv;
+out vec2 vUv;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+}
+`;
+    const renderFragmentShaderText = `
+precision highp float;
+precision highp int;
+
+// #include <packing>
+
+layout(location = 0) out vec4 outColor;
+
+in vec2 vUv;
+
+struct Surface {
+    vec3 baseColor;
+    vec3 normal;
+    vec3 worldPosition;
+};
+
+struct PointLight {
+    vec3 position;
+    float intensity;
+    float distance;
+    vec3 color;
+};
+
+struct Camera {
+    vec3 position;
+};
+
+uniform sampler2D uDiffuse;
+uniform sampler2D uNormal;
+uniform sampler2D uDepth;
+uniform Camera uCamera;
+// uniform sampler2D uWorldPosition;
+uniform PointLight[${lightPropsNum}] uPointLights;
+uniform float uCameraNear;
+uniform float uCameraFar;
+uniform mat4 uInverseViewMatrix;
+uniform mat4 uInverseProjectionMatrix;
+
+uniform mat4 viewMatrix;
+uniform mat4 projectionMatrix;
+
+vec3 getWorldPositionFromDepth(vec2 uv, float depth) {
+    vec4 ndc = vec4(uv * 2. - 1., depth * 2. - 1., 1.);
+    vec4 wp = uInverseViewMatrix * uInverseProjectionMatrix * ndc;
+    wp.xyz /= wp.w;
+    return wp.xyz;
+}
+
+vec3 calcPointLight(PointLight pointLight, Surface surface, Camera camera) {
+    // common
+    vec3 rawPtoL = pointLight.position - surface.worldPosition;
+    vec3 rawPtoE = camera.position - surface.worldPosition;
+    vec3 PtoL = normalize(rawPtoL);
+    vec3 PtoE = normalize(rawPtoE);
+    vec3 HalfV = normalize(PtoL + PtoE);
+    vec3 reflectV = reflect(-PtoL, surface.normal);
+    float distPtoL = length(rawPtoL);
+    // float attenuation = pointLight.intensity / (1.0 + 0.1 * distPtoL + 0.01 * distPtoL * distPtoL);
+    float attenuation = clamp(pointLight.intensity / (1. + distPtoL * distPtoL), 0., 1.);
+    float angle = dot(surface.normal, PtoL);
+    
+    // diffuse
+    vec3 diffuseColor = vec3(0.);
+    if(angle > 0.)
+    {
+        float diffuseRate = clamp(dot(surface.normal, PtoL), 0., 1.);
+        diffuseColor = surface.baseColor * pointLight.color * diffuseRate * attenuation;
+        // diffuseColor = vec3(diffuseRate);
+        // diffuseColor = vec3(attenuation);
+    }
+    
+    // specular
+    vec3 specularColor = vec3(0.);
+    if(angle > 0.)
+    {
+        // 1: use reflect V
+        // float specularRate = clamp(dot(PtoE, reflectV), 0., 1.);
+        // 2: use half V
+        float specularRate = max(0., dot(surface.normal, HalfV));
+        float specularPower = 64.;
+        float specular = pow(specularRate, specularPower);
+        specularColor = vec3(specular) * pointLight.color * attenuation;
+    }
+    
+    // result
+    // vec3 resultColor = diffuseColor;
+    // vec3 resultColor = specularColor;
+    vec3 resultColor = diffuseColor + specularColor;
+    
+    resultColor = clamp(resultColor, vec3(0.), vec3(1.));
+    
+    return resultColor;
+}
+
+void main() {
+    vec4 gBufferColor = texture(uDiffuse, vUv);
+    vec3 baseColor = gBufferColor.xyz;
+    float material = gBufferColor.a;
+    vec3 normal = texture(uNormal, vUv).rgb * 2. - 1.;
+    normal = normalize(normal);
+    float depth = texture(uDepth, vUv).x;
+    vec3 worldPosition = getWorldPositionFromDepth(vUv, depth);
+    
+    Surface surface = Surface(baseColor, normal, worldPosition);
+    Camera camera = Camera(uCamera.position);
+    
+    vec3 color = vec3(0.);
+   
+    if (material < .5) // lit
+    {
+        for(int i = 0; i < ${lightPropsNum}; i++)
+        {
+            PointLight pointLight = uPointLights[i];
+            color += calcPointLight(pointLight, surface, camera);
+        }
+    } else { // unlit
+        color += baseColor;
+    }
+
+    outColor.rgb = color;
+   
+    // for debug 
+    // outColor.rgb = normal;
+    // outColor.rgb = worldPosition;
+   
+    // mask
+    outColor.rgb *= sign(1. - depth);
+    outColor.a = 1.;
+}
+`;
+    const wrapperElement = document.getElementById("js-wrapper");
+    const canvasElement = document.getElementById("js-canvas");
+
+    const ratio = Math.min(window.devicePixelRatio, 1.5);
+
+    const renderer = new THREE.WebGLRenderer({ canvas: canvasElement });
+    renderer.setPixelRatio(ratio);
+   
+    const gBufferPaths = [
+        {
+            name: "diffuse",
+        },
+        {
+            name: "normal"
+        },
+        // {
+        //     name: "shading model"
+        // }
+    ]
+    
+    const renderTarget = new THREE.WebGLMultipleRenderTargets(1, 1, gBufferPaths.length);
+    renderTarget.texture.forEach(texture => {
+        texture.minFilter = THREE.NearestFilter;
+        texture.magFilter = THREE.NearestFilter;
+    });
+    gBufferPaths.forEach((({ name }, i) => {
+        renderTarget.texture[i].name = name;
+    }));
+    // renderTarget.texture[2].name = "emission";
+    // renderTarget.texture[2].name = "worldPosition";
+    
+    renderTarget.depthTexture = new THREE.DepthTexture();
+    
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    
+    const gBufferOpaqueMeshes = [];
+    
+    let width, height;
+    
+    const materialType = {
+        lit: 0,
+        unlit: 1
+    };
+    
+    const createGBufferMaterial = (type, materialOptions = {}, overrideUniformOptions = {}) => {
+        return new THREE.RawShaderMaterial({
+            vertexShader: gbufferVertexShaderText,
+            fragmentShader: gbufferFragmentShaderText,
+            uniforms: {
+                uWorldNormalMatrix: {
+                    value: new THREE.Matrix3()
+                },
+                uMaterial: {
+                    value: type === materialType.lit ? 0 : 1
+                },
+                uBaseColor: {
+                    value: new THREE.Color()
+                },
+                ...overrideUniformOptions,
+            },
+            glslVersion: THREE.GLSL3,
+            ...materialOptions,
+        })
+    }
+    
+    const createGBufferLitMaterial = (materialOptions = {}, uniformOptions = {}) => {
+        return createGBufferMaterial(materialType.lit, materialOptions, uniformOptions)
+    }
+    
+    const createGBufferUnlitMaterial = (materialOptions = {}, uniformOptions = {}) => {
+        return createGBufferMaterial(materialType.unlit, materialOptions, uniformOptions)
+    }
+    
+    const debugMesh = new THREE.Mesh(
+        // new THREE.BoxGeometry(2, 2, 2),
+        // new THREE.SphereGeometry(1, 32, 32),
+        // new THREE.TorusKnotGeometry( 1, 0.3, 128, 32 ),
+        new THREE.TorusGeometry( 1, 0.3, 32, 32 ),
+        createGBufferLitMaterial()
+    );
+    debugMesh.material.uniforms.uBaseColor.value = new THREE.Color(1, 1, 1);
+    debugMesh.position.y = 1.4;
+    // debugMesh.position.x = 0;
+    // debugMesh.position.y = 1;
+    // debugMesh.position.z = 0;
+    scene.add(debugMesh);
+    
+    gBufferOpaqueMeshes.push(debugMesh);
+    
+    const floorMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(10, 10, 2, 2),
+        createGBufferLitMaterial({ side: THREE.DoubleSide })
+    );
+    floorMesh.material.uniforms.uBaseColor.value = new THREE.Color(1, 1, 1);
+    floorMesh.rotation.x = (-90 / 180) * Math.PI;
+    scene.add(floorMesh);
+
+    gBufferOpaqueMeshes.push(floorMesh);
+
+    // fake bg
+    const backgroundMesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(1000, 1000, 2, 2),
+        createGBufferLitMaterial({ side: THREE.DoubleSide })
+    );
+    backgroundMesh.material.uniforms.uBaseColor.value = new THREE.Color(0, 0, 0);
+    scene.add(backgroundMesh);
+    gBufferOpaqueMeshes.push(backgroundMesh);
+
+    const sceneCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
+    sceneCamera.position.copy(new THREE.Vector3(2, 2, 5))
+    sceneCamera.lookAt(debugMesh.position);
+
+    const orbitControls = new THREE.OrbitControls(sceneCamera, canvasElement);
+    
+    const lightProps = [...Array(lightPropsNum)].map((i) => {
+        const lightPropsGroup = new THREE.Object3D();
+        const color = (new THREE.Color()).setHSL(Math.random(), 1, 0.5);
+        const intensity = 0.4;
+        const p = new THREE.Vector3().randomDirection().multiplyScalar(5);
+        lightPropsGroup.position.copy(p)
+        lightPropsGroup.add(new THREE.PointLight(color, intensity, 100));
+
+        const lightPropMesh = new THREE.Mesh(
+            new THREE.SphereGeometry(0.1, 8, 8),
+            // createGBufferLitMaterial(),
+            createGBufferUnlitMaterial()
+        );
+        lightPropMesh.material.uniforms.uBaseColor.value = color;
+        lightPropsGroup.add(lightPropMesh);       
+        
+        scene.add(lightPropsGroup);
+
+        gBufferOpaqueMeshes.push(lightPropMesh);
+        
+        return lightPropsGroup;
+    });
+
+    const postprocessScene = new THREE.Scene();
+    const postprocessCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    
+    const postprocessMaterial = new THREE.RawShaderMaterial({
+        vertexShader: renderVertexShaderText,
+        fragmentShader: renderFragmentShaderText,
+        uniforms: {
+            uDiffuse: {
+                value: renderTarget.texture[0]
+            },
+            uNormal: {
+                value: renderTarget.texture[1]
+            },
+            uDepth: {
+                value: renderTarget.depthTexture,
+            },
+            uCameraNear: {
+                value: 0,
+            },
+            uCameraFar: {
+                value: 1
+            },
+            uInverseViewMatrix: {
+                value: new THREE.Matrix4()
+            },
+            uInverseProjectionMatrix: {
+                value: new THREE.Matrix4()
+            },
+            uPointLights: {
+                value: []
+            },
+            uCamera: {
+                value: {}
+            }
+        },
+        glslVersion: THREE.GLSL3
+    });
+    
+     
+    const postprocessPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(2, 2),
+        postprocessMaterial
+    );
+    
+    postprocessScene.add(postprocessPlane);
+    
+    const setSize = () => {
+        width = wrapperElement.offsetWidth;
+        height = wrapperElement.offsetHeight;
+        sceneCamera.aspect = width / height;
+        sceneCamera.updateProjectionMatrix();
+        renderer.setSize(width, height);
+        renderTarget.setSize(width * ratio, height * ratio);
+    }
+    
+    const tick = (time) => {
+        debugMesh.rotation.x = time * 0.0001;
+        debugMesh.rotation.y = time * 0.0002;
+        debugMesh.rotation.z = time * 0.0003;
+       
+        renderTarget.samples = 2;
+
+        // ref: https://github.com/mrdoob/three.js/pull/24141
+        // safari prior 15.5 needs the renderer to be cleared()
+        if ( renderTarget.samples > 0 ) {
+            renderer.clear();
+        }
+
+        orbitControls.update();
+
+        // const inverseViewProjectionMatrix = new THREE.Matrix4().multiplyMatrices(sceneCamera.projectionMatrixInverse, sceneCamera.matrixWorldInverse);
+        const inverseViewProjectionMatrix = new THREE.Matrix4().multiplyMatrices(sceneCamera.matrixWorldInverse, sceneCamera.projectionMatrixInverse);
+     
+        lightProps.forEach((lightPropsGroup, i) => {
+            lightPropsGroup.position.y = Math.sin(time * 2 / 1000 + i * 100) * 0.6 + 0.7;
+        });
+        
+        const p = (new THREE.Vector3()).addVectors(
+            sceneCamera.position.clone(),
+            sceneCamera.getWorldDirection(new THREE.Vector3()).multiplyScalar(sceneCamera.far - 0.01)
+        );
+        backgroundMesh.position.copy(p);
+        backgroundMesh.lookAt(sceneCamera.position);
+
+        gBufferOpaqueMeshes.forEach((mesh) => {
+            mesh.material.uniforms.uWorldNormalMatrix.value = (new THREE.Matrix3()).getNormalMatrix(mesh.matrixWorld);
+            mesh.material.uniforms.uWorldNormalMatrix.value = (new THREE.Matrix3()).getNormalMatrix(mesh.matrixWorld);
+        });
+        
+        const pointLights = [];
+
+        scene.traverse(obj => {
+            if(obj.isPointLight) {
+                pointLights.push({
+                    color: obj.color,
+                    intensity: obj.intensity,
+                    distance: obj.distance,
+                    position: obj.getWorldPosition(new THREE.Vector3())
+                });
+            }
+        });
+
+        postprocessMaterial.uniforms.uCameraNear.value = sceneCamera.near;
+        postprocessMaterial.uniforms.uCameraFar.value = sceneCamera.far;
+        // postprocessMaterial.uniforms.uInverseViewMatrix.value = sceneCamera.matrixWorldInverse.clone();
+        postprocessMaterial.uniforms.uInverseViewMatrix.value = sceneCamera.matrixWorld.clone();
+        postprocessMaterial.uniforms.uInverseProjectionMatrix.value = sceneCamera.projectionMatrixInverse.clone();
+        postprocessMaterial.uniforms.uPointLights.value = pointLights;
+        postprocessMaterial.uniforms.uCamera.value = {
+            position: sceneCamera.getWorldPosition(new THREE.Vector3())
+        }
+
+        // console.log("========")
+        // console.log(sceneCamera.matrixWorldInverse)
+        // console.log(sceneCamera.projectionMatrixInverse)
+        
+        renderer.setRenderTarget(renderTarget);
+        renderer.render(scene, sceneCamera);
+
+        renderer.setRenderTarget(null);
+        renderer.render(postprocessScene, postprocessCamera);
+
+        requestAnimationFrame(tick);
+    }
+   
+    setSize();
+    window.addEventListener('resize', () => setSize());
+    
+    requestAnimationFrame(tick);
+</script>
+
+</body>
+</html>
