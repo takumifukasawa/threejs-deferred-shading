@@ -99,7 +99,7 @@ void main() {
 precision highp float;
 precision highp int;
 
-// #include <packing>
+#include <packing>
 
 layout(location = 0) out vec4 outColor;
 
@@ -136,10 +136,20 @@ uniform mat4 viewMatrix;
 uniform mat4 projectionMatrix;
 
 vec3 getWorldPositionFromDepth(vec2 uv, float depth) {
-    vec4 ndc = vec4(uv * 2. - 1., depth * 2. - 1., 1.);
-    vec4 wp = uInverseViewMatrix * uInverseProjectionMatrix * ndc;
-    wp.xyz /= wp.w;
+    // original
+    // vec4 ndc = vec4(uv * 2. - 1., depth * 2. - 1., 1.);
+    // vec4 wp = uInverseViewMatrix * uInverseProjectionMatrix * ndc;
+    // wp.xyz /= wp.w;
+    // return wp.xyz;
+    
+    float d = unpackRGBAToDepth(texture(uDepth, uv));
+    vec4 ndc = vec4(uv * 2. - 1., d * 2. - 1., 1.);
+    vec4 vp = uInverseProjectionMatrix * ndc;
+    vp.xyz /= vp.w;
+    vec4 wp = uInverseViewMatrix * vec4(vp.xyz, 1.);
     return wp.xyz;
+    // vec4 wp = uInverseViewMatrix * uInverseProjectionMatrix * ndc;
+    // wp.xyz /= wp.w;
 }
 
 vec3 calcPointLight(PointLight pointLight, Surface surface, Camera camera) {
@@ -224,6 +234,15 @@ void main() {
     // mask
     // outColor.rgb *= sign(1. - depth);
     outColor.a = 1.;
+    
+    float d = unpackRGBAToDepth(texture(uDepth, vUv));
+    vec4 ndc = vec4(vUv * 2. - 1., d * 2. - 1., 1.);
+    vec4 vp = uInverseProjectionMatrix * ndc;
+    vp.xyz /= vp.w;
+    vec4 wp = uInverseViewMatrix * vp;
+    // vec4 wp = uInverseViewMatrix * uInverseProjectionMatrix * ndc;
+    // wp.xyz /= wp.w;
+    // outColor.rgb = vec3(wp.xyz);
     
     outColor = clamp(outColor, vec4(0.), vec4(1.));
 }
@@ -330,7 +349,8 @@ void main() {
     gBufferOpaqueMeshes.push(motifSphereMesh);
 
     const sceneCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 50);
-    sceneCamera.position.copy(new THREE.Vector3(3, 3, 7))
+    // sceneCamera.position.copy(new THREE.Vector3(3, 3, 7))
+    sceneCamera.position.copy(new THREE.Vector3(0, 0, 7))
     sceneCamera.lookAt(motifSphereMesh.position);
 
     const orbitControls = new THREE.OrbitControls(sceneCamera, canvasElement);
