@@ -8,7 +8,7 @@ threejs: v144
 
 ## demo
 
-demo base: [](https://takumifukasawa.github.io/threejs-deferred-shading/base.html)
+demo base: [https://takumifukasawa.github.io/threejs-deferred-shading/base.html](https://takumifukasawa.github.io/threejs-deferred-shading/base.html)
 
 point light: [https://takumifukasawa.github.io/threejs-deferred-shading/point-light.html](https://takumifukasawa.github.io/threejs-deferred-shading/point-light.html)
 
